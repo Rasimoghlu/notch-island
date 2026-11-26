@@ -1,9 +1,23 @@
 # Notch Island
 
-A menu-bar agent that turns the MacBook notch into a small developer dashboard:
-Claude Code / Codex usage limits, open ports, long-running shell commands, git status,
-and alerts when an agent needs you, finished or failed. Everything is local: no network
-calls, no tokens, no telemetry.
+A menu-bar agent that turns the MacBook notch into a small developer dashboard for Claude Code:
+usage limits with a pace forecast, what Claude (and its subagents) is doing right now, listening
+ports, long-running shell commands, git status, and alerts when an agent needs you, finished or
+failed. Everything is local: no network calls, no tokens, no telemetry.
+
+## Quick start
+
+```sh
+git clone https://github.com/Rasimoghlu/notch-island.git
+cd notch-island
+scripts/build-app.sh --install   # builds, copies to ~/Applications, launches
+hooks/install.sh --dry-run       # see exactly what the hooks change
+hooks/install.sh                 # apply (asks y/N per file, makes backups)
+```
+
+Then restart running Claude Code sessions and open a new terminal tab. Building from source is
+also the easiest way to share it: an app you build yourself is not quarantined, so Gatekeeper
+does not block it (see "Sharing" below).
 
 | State | What you see |
 |---|---|
@@ -86,9 +100,9 @@ macOS has no public API to read Focus / Do Not Disturb, so the app does not foll
 
 ## Requirements
 
-- macOS 14+, Apple Silicon or Intel
+- macOS 14+ on Apple Silicon. The build is `arm64` only; a universal (Intel) build needs Xcode.
 - Swift 5.9+ toolchain. **Xcode is not required**: Command Line Tools are enough
-  (`xcode-select --install`). With Xcode installed you can also open `Package.swift`.
+  (`xcode-select --install`), with the SDK caveat below. With Xcode you can also open `Package.swift`.
 
 ## Build and run
 
@@ -110,6 +124,16 @@ The app has no Dock icon (`LSUIElement`). Use the menu-bar icon for **Show Islan
 It is **not sandboxed** on purpose: it runs `lsof`, `ps`, `git` and `docker`, reads
 `~/.claude`, and sends `SIGTERM` to processes you choose to kill. Distribute outside
 the App Store.
+
+### Sharing
+
+The app is ad-hoc signed, so a copied or downloaded `.app` is rejected by Gatekeeper on another
+Mac ("developer cannot be verified"). Options:
+
+- **Build from source** on each Mac (Quick start above). Nothing is quarantined, nothing is blocked.
+- Send the `.app` and have the receiver run `xattr -dr com.apple.quarantine "Notch Island.app"` once.
+- For a proper release: sign with a Developer ID certificate and notarize (Apple Developer
+  Program membership needed).
 
 ## Hook setup
 
@@ -158,9 +182,10 @@ Restart running Claude Code sessions and open a new terminal tab afterwards.
 | Codex 5-hour | `rate_limits` in the newest `~/.codex/sessions/YYYY/MM/DD/*.jsonl` | On expand, then every 30 s while expanded |
 | Working / Radar | `~/.claude/sessions/<pid>.json` (`status`: busy/idle, `cwd`) | File watch |
 | Now | Tail of the busy session's transcript (`~/.claude/projects/*/<session>.jsonl`): tool calls of the current turn in plain words, files changed. Subagents come from `Agent` calls; each one's own transcript (`<session>/subagents/agent-<id>.jsonl`) gives its current step, and it counts as running while that file was written in the last 30 s | On expand, then every 3 s while expanded |
-| Open ports | `lsof -nP -iTCP -sTCP:LISTEN`, cwd via `lsof -a -p PIDS -d cwd -Fn`, `ps` for the dev-server name, `docker ps` when a Docker socket exists. By default only **project** servers are listed: the process runs from a folder inside home (not home itself, `~/Library` or hidden folders) or on `/Volumes`, plus Docker containers. Apps, system daemons and Claude/Codex's own ports are hidden (toggle in Settings) | 3 s expanded, 60 s collapsed |
+| Ports (under Now) | `lsof -nP -iTCP -sTCP:LISTEN`, cwd via `lsof -a -p PIDS -d cwd -Fn`, `ps` for the dev-server name, `docker ps` when a Docker socket exists. By default only **project** servers are listed: the process runs from a folder inside home (not home itself, `~/Library` or hidden folders) or on `/Volumes`, plus Docker containers. Apps, system daemons and Claude/Codex's own ports are hidden (toggle in Settings) | 3 s expanded, 60 s collapsed |
 | Commands | zsh `preexec`/`precmd` hook → `~/.notch-island/shell/` and `events/` | File watch |
-| Git | `git rev-parse` / `status --porcelain` / `rev-list @{upstream}..HEAD` in the active session's folder | 9 s while expanded |
+| Git | The first git repo among: the busy session's folder, other sessions, shell commands, then the folders behind open ports (dev servers, compose projects). `rev-parse` / `status --porcelain` / `rev-list @{upstream}..HEAD` | 9 s while expanded |
+| Git account | GitHub login from gh's local `~/.config/gh/hosts.yml` (no API call), `user.name` / `user.email` as git resolves them; warns when no email is set | With the git card |
 | Alerts | Claude hooks → `~/.notch-island/events/*.json` | File watch |
 
 ### Why no OAuth / usage endpoint
@@ -191,17 +216,20 @@ Deny sends Claude the message "Denied from Notch Island."
 ```
 Package.swift                 targets: NotchIslandCore, NotchIsland, notch-hook, selftest
 Sources/NotchIslandCore/      pure logic, Foundation only
-  IslandMachine.swift         state + reducer (the state machine)
-  Usage.swift                 UsageProvider protocol, Claude/Codex providers, Forecast
+  IslandMachine.swift         state + reducer (the state machine), away digest
+  Usage.swift                 UsageProvider protocol, Claude/Codex providers, Forecast, Pace, context
+  LimitWatch.swift            80/90/95 % and reset alerts, once per window
+  LiveActivity.swift          transcript tail → current step, recent steps, subagents
   ClaudeLogScanner.swift      incremental jsonl token reader
-  Ports.swift                 lsof / ps / docker parsers
-  Sessions.swift              ~/.claude/sessions, transcript turn summary
+  Ports.swift                 lsof / ps / docker parsers, Claude ownership, orphans, compose groups
+  Sessions.swift              ~/.claude/sessions, turn summary, git identity
   AgentEvent.swift, Paths.swift, Fmt.swift
 Sources/NotchIsland/          the app (AppKit + SwiftUI)
   App/        entry, AppModel (store + scheduling), Snapshot (dev tool)
   Window/     NotchPanel, PanelController (hit-testing, hover), IslandLayout
-  Services/   Shell, FileWatcher (FSEvents), ProcessControl, Docker, Git, settings
-  UI/         root view + shape morph, compact, alert, expanded tabs and cards
+  Services/   Shell, FileWatcher (FSEvents), ProcessControl, Docker, Git, HotKeys, settings
+  UI/         root view + shape morph, compact, alerts, split bubble, Motion (all timings), Theme
+  UI/Expanded Overview (Usage, Now + ports strip, Commands + Git), Radar, Settings
 Sources/notch-hook/           CLI called by Claude hooks and the status line
 Sources/selftest/             assertion tests
 hooks/                        notch-island.zsh, install.sh, uninstall.sh, merge_settings.py
@@ -225,8 +253,9 @@ The black shape is a single `NotchShape`: a body with rounded bottom corners who
 flare outward with a small concave curve, the way the hardware notch meets the screen edge. In
 idle the body is exactly the notch cut-out, so the island grows out of it and shrinks back into
 it. When opening, the width leads by a hair and the height follows (alerts overshoot a little).
-When closing, the content blinks out first (70 ms), then every edge converges onto the notch outline
-together on a critically damped spring, so it never undershoots and slips behind the cut-out. Content enters once the shape is about two-thirds open (~95 ms): the header, then the cards
+When closing, the content blinks out first (70 ms), then every edge converges onto the notch
+outline together on a critically damped spring, so it never undershoots and slips behind the
+cut-out. Content enters once the shape is about two-thirds open (~95 ms): the header, then the cards
 30 ms apart, each fading in, rising a few points and un-blurring. A full open takes about
 0.3 s and a close about 0.25 s. Every timing lives in `UI/Motion.swift`.
 
@@ -240,9 +269,11 @@ The status dot moves between the compact notch and the header with `matchedGeome
 
 ### Performance
 
-Measured on this machine: **0.0% CPU** idle and in the compact working state, 16–40 MB RSS.
+Measured on this machine: **0.0% CPU** idle and in the compact working state, about 50–60 MB RSS.
 - The working dot's pulse is a Core Animation layer animation (it runs in the render server).
 - The liquid wave, orbit rings and needs-you glow exist only while their view is on screen.
+- Transcripts, git and ports are read only while the island is open (ports also once a minute
+  when closed). The frosted blur is drawn by the WindowServer.
 - Reduce Motion or Low Power Mode turns off every loop and the bounce.
 - When collapsed, the panel ignores the mouse, so clicks reach the menu bar. A mouse-moved
   monitor turns hit-testing on only inside the current shape.
@@ -250,8 +281,9 @@ Measured on this machine: **0.0% CPU** idle and in the compact working state, 16
 ## Development
 
 ```sh
+export SDKROOT=/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk   # see the SDK note
 swift build                          # debug build of everything
-swift run selftest                   # 85 checks: state machine, parsers, forecast, formats
+swift run selftest                   # 101 checks: state machine, parsers, forecast, live activity, ports
 .build/debug/NotchIsland --demo overview          # live panel with sample data (overview|radar|settings|compact|needs|done|limits|idle)
 .build/debug/NotchIsland --snapshot radar out.png # render a state to PNG with this Mac's notch shown in red (--no-notch to hide)
 .build/debug/NotchIsland --snapshot-morph compact:expanded frames   # PNG frames during a transition
@@ -283,7 +315,11 @@ To add a new agent, write these files from its hooks. To add a new usage source,
   Claude Code session renders its status line. If you mostly chat in the desktop app, the number
   can be behind; the card then says "as of N min ago". Polling Anthropic's unofficial usage
   endpoint with Claude Code's Keychain login would fix this, and was deliberately left out.
-
+- Subagents launched in the background return at once, so one counts as running while its own
+  transcript was written in the last 30 s. An agent thinking for longer can briefly show as done.
+- Apple Silicon only, ad-hoc signed (see Sharing). No auto-update: pull and run
+  `scripts/build-app.sh --install` again.
+- On very bright windows the frosted panel's contrast drops a little; tune `Theme.islandOpacity`.
 - Radar "Focus" brings the session's terminal **app** forward, not the specific tab.
 - The menu bar must not auto-hide for hover to feel right on Macs without a notch.
 - Over full-screen apps the panel uses `.statusBar + 1` with `fullScreenAuxiliary`. This
